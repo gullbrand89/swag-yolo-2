@@ -1,1 +1,32 @@
+4. Model architecture
+
+The model is a standard encoder–decoder transformer of about 10 M parameters (Table X). The encoder reads the pulse sequence, the decoder writes the record, and six auxiliary heads on the encoder output provide the counts and per-pulse targets described in Section 3.
+
+Input. Each pulse enters as the sum of six embeddings: a learned embedding of its quantised PRI (4096 linear bins over 1–1009 µs, so that merged intervals up to twice the maximum PRI still fall inside the grid), a linear projection of the continuous PRI, and learned embeddings of three integer channels computed deterministically from the signal — run length within the current level, recurrence (visits since the same level was last seen) and visit index counted from the end of the window. The sixth channel, time of arrival, does not enter as an embedding but drives the positional encoding.
+
+Positional encoding. The encoder uses rotary position embeddings (RoPE), which rotate each query and key by an angle proportional to a position, so that the attention score between two pulses depends on their relative position rather than on absolute indices. The choice of what "position" means is the one non-standard element. A plain index (pulse 0, 1, 2, …) is what text models use, but for a pulse train it is unreliable: a dropped pulse shifts every later index by one, and the true distance between two pulses is a time, not a count. Time of arrival, on the other hand, is unaffected by dropout and is the coordinate in which periodicity lives — two pulses one full cycle apart are at the same time distance whatever was lost in between. But time alone loses something too: dwell times are counted in pulses, and whether two pulses are neighbours or have a gap between them is a question of index. The encoder therefore uses a hybrid: half of the rotary dimension pairs take their angle from time of arrival (scaled by the mean PRI of the corpus, ≈ 143 µs per unit), the other half from the pulse index. Attention can then measure both elapsed time and pulse count between any two pulses, and a mismatch between the two — a time gap larger than the index gap warrants — is itself the signature of a dropped pulse. The 50/50 split is a design choice and was not tuned. The rotations are computed in fp32 even under mixed precision, since angles reach thousands of radians for long windows and bf16 cannot represent them accurately.
+
+Encoder. Four pre-norm layers, eight heads, feed-forward width 1024, GELU, dropout 0.1. Queries and keys are layer-normalised before the rotation (QK normalisation); without it the attention logits grew with the weight norms over training, the softmax collapsed towards one-hot and the gradient through attention died slowly, independently of the learning rate.
+
+Decoder. Four standard pre-norm layers with causal self-attention and cross-attention to the encoder output. Its input is the token embedding plus a sinusoidal absolute position plus a learned segment position — the number of tokens since the last structural token (LEVELS, S, SEEN). The segment position gives the decoder its "j" directly: when writing the j-th state block it knows it is at position j without counting from a block start that itself depends on how many levels were listed. The output layer scores the 2127-token vocabulary, masked at inference by the grammar and by the count and period heads.
+
+Table X. Model and training parameters.
+
+	
+d_model / heads / feed-forward	256 / 8 / 1024
+Encoder / decoder layers	4 / 4 (pre-norm, GELU, dropout 0.1)
+Parameters	≈ 9.7 M (of which 1.1 M input embeddings, 3.2 M encoder, 4.2 M decoder, 1.1 M output vocabulary)
+Input window	512 pulses, 6 channels
+Positional encoding	hybrid RoPE: ½ time of arrival, ½ pulse index; QK-norm
+Decoder position	sinusoidal index + learned segment position (≤ 64)
+Vocabulary	2127 tokens: 2048 bins, 32 level names, 33 dwell values, 11 structural, 3 special
+Max record length	256 tokens (longest valid record 227)
+Optimiser	AdamW, lr 3·10⁻⁴, 500 warmup steps, cosine decay, weight decay 0.01
+Batch / steps	64 / 20 000 (≈ 2 h on a consumer GPU)
+Loss	cross-entropy per record field (bins, dwells, type, order, grammar) with ordinal smoothing σ = 0.5; auxiliary heads weighted 0.3 (per-pulse) and 1.0 (count, period)
+Training dropout rate	uniform 0–25 % per example
+
+
+
+
 Read the example record LEVELS L0 B482 L1 B613 L2 B1210  S L2 D3  S L0 D1  S L2 D3  S L1 D7  SEEN D2  END as follows. The emitter has three PRI levels, named L0–L2 in ascending order and quantised to bins (B482 ≈ 119.6 µs). It cycles through four states, listed backwards in time from the end of the window: the state in progress when the window ends is L2 for 3 pulses, the one before it was L0 for 1 pulse, and so on. Two of the states — L2 for 3 pulses — are identical and become one state in the emitter model, visited twice per cycle. SEEN D2 says that 2 of the current state's 3 pulses have been observed, so the emitter will stay one more pulse before moving on. In terms of the emitter model, the LEVELS block gives the components Φ, each S block gives a state in θ, the order of the S blocks gives the state sequence λ, and SEEN gives the phase.
